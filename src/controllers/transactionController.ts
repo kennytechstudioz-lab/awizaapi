@@ -1,0 +1,488 @@
+import { Request, Response } from 'express'
+import { queryData } from '../utils/query'
+import { handleError } from '../utils/errorHandler'
+import { ITransaction, Transaction } from '../models/transactionModel'
+import { IProduct, Product } from '../models/productModel'
+import { uploadFilesToS3 } from '../utils/fileUpload'
+import { User } from '../models/users/userModel'
+import { sendNotification } from '../utils/sendNotification'
+import { io } from '../app'
+import { Company } from '../models/company/companyModel'
+
+export const purchaseProducts = async (req: Request, res: Response) => {
+  try {
+    const product = req.body.product
+    await Product.findByIdAndUpdate(product._id, {
+      $inc: { units: product.cartUnits * (product.unitPerPurchase || 1) },
+    })
+    await Transaction.create(req.body)
+
+    const result = await queryData<IProduct>(Product, req)
+
+    res.status(200).json({
+      message: 'Product purchase has been successfully recorded.',
+      result,
+    })
+  } catch (error: any) {
+    handleError(res, undefined, undefined, error)
+  }
+}
+
+export const updatePartPayment = async (req: Request, res: Response) => {
+  try {
+    const user = await User.findOne({ username: req.body.username })
+    const trx = await Transaction.findById(req.params.id)
+    const transaction = await Transaction.findByIdAndUpdate(
+      req.params.id,
+      {
+        $inc: { partPayment: req.body.partPayment },
+        status:
+          trx.partPayment + Number(req.body.partPayment) >= trx.totalAmount,
+      },
+      { new: true }
+    )
+
+    let notificationResult = null
+
+    if (transaction.status) {
+      notificationResult = await sendNotification('completed', {
+        user,
+        transaction,
+      })
+    } else {
+      notificationResult = await sendNotification('part_payment', {
+        user,
+        transaction,
+      })
+    }
+
+    const result = await queryData<IProduct>(Product, req)
+    res.status(200).json({
+      message: 'The transaction has been created successfully.',
+      result,
+      transaction,
+      notificationResult,
+    })
+  } catch (error: any) {
+    handleError(res, undefined, undefined, error)
+  }
+}
+
+export const createTrasanction = async (req: Request, res: Response) => {
+  try {
+    const uploadedFiles = await uploadFilesToS3(req)
+    uploadedFiles.forEach((file) => {
+      req.body[file.fieldName] = file.s3Url
+    })
+    const safeParse = (val: any, fallback: any) => {
+      try {
+        if (typeof val === 'string' && val !== 'undefined') return JSON.parse(val)
+        return (val === 'undefined' || val === undefined) ? fallback : val
+      } catch (e) {
+        return fallback
+      }
+    }
+
+    const cartProducts = safeParse(req.body.cartProducts, [])
+    req.body.cartProducts = cartProducts
+    req.body.status = safeParse(req.body.status, true)
+    req.body.isProfit = safeParse(req.body.isProfit, true)
+    req.body.partPayment = safeParse(req.body.partPayment, 0)
+
+    if (!Array.isArray(cartProducts) || cartProducts.length === 0) {
+      return res.status(400).json({ message: 'Cart is empty' })
+    }
+
+    const productIds = cartProducts.map((p) => p._id)
+    const dbProducts = await Product.find({ _id: { $in: productIds } })
+
+    if (dbProducts.length !== productIds.length) {
+      const missingIds = productIds.filter(
+        (id) => !dbProducts.find((p) => p._id.toString() === id.toString())
+      )
+      return res.status(404).json({
+        message: `Some products were not found: ${missingIds.join(', ')}`,
+      })
+    }
+
+    const outOfStock: { name: string; available: number; requested: number }[] =
+      []
+
+    for (const cartItem of cartProducts) {
+      const product = dbProducts.find(
+        (p) => p._id.toString() === cartItem._id.toString()
+      )
+      if (!product) continue
+      if (product.units < cartItem.cartUnits * (cartItem.unitPerPurchase || 1)) {
+        outOfStock.push({
+          name: product.name,
+          available: product.units,
+          requested: cartItem.cartUnits,
+        })
+      }
+    }
+
+    if (outOfStock.length > 0) {
+      return res.status(400).json({
+        message:
+          'Some items are out of stock. Please adjust your order and try again.',
+        outOfStock,
+      })
+    }
+
+    // --- NEW VALIDATION: Customer check before any mutation ---
+    if (req.body.userId === '' || !req.body.userId) {
+      const existingUser = await User.findOne({ phone: req.body.phone })
+      if (existingUser) {
+        return res.status(400).json({
+          message: `A customer with this phone number (${req.body.phone}) already exists. Please search and select the customer instead of entering details again.`,
+        })
+      }
+    }
+
+    const bulkOps = cartProducts.map((cartItem) => ({
+      updateOne: {
+        filter: { 
+          _id: cartItem._id,
+          units: { $gte: cartItem.cartUnits * (cartItem.unitPerPurchase || 1) }
+        },
+        update: {
+          $inc: { units: -cartItem.cartUnits * (cartItem.unitPerPurchase || 1) },
+        },
+      },
+    }))
+
+    const bulkResult = await Product.bulkWrite(bulkOps)
+    if (bulkResult.modifiedCount !== cartProducts.length) {
+      return res.status(400).json({
+        message: 'Some items could not be processed due to insufficient stock. Please refresh and try again.',
+      })
+    }
+    const company = await Company.findOne()
+    const prefix = 'AWZ'
+    const domain = company && company.domain ? company.domain.replace(/^https?:\/\//, '').split('/')[0] : 'awizafarms.com'
+
+    const sales = await Transaction.countDocuments()
+    req.body.invoiceNumber = `${prefix}-${req.body.invoiceNumber}${sales + 1}`
+
+    if (!req.body.email || req.body.email.trim() === '' || req.body.email === 'undefined') {
+      const namePart = req.body.fullName
+        ? req.body.fullName.toLowerCase().replace(/[^a-z0-9]/g, '')
+        : 'customer'
+      const randomPart = Math.floor(1000 + Math.random() * 9000)
+      req.body.email = `${namePart}${randomPart}@${domain}`
+    }
+
+    const transaction = await Transaction.create(req.body)
+
+    if (!req.body.userId || req.body.userId === '') {
+      await User.findOneAndUpdate(
+        { phone: req.body.phone },
+        {
+          username: req.body.username ? req.body.username : req.body.email,
+          phone: req.body.phone,
+          email: req.body.email,
+          address: req.body.address,
+          fullName: req.body.fullName,
+        },
+        { new: true, upsert: true }
+      )
+    }
+    const user = await User.findOneAndUpdate(
+      { phone: req.body.phone },
+      {
+        $inc: { totalPurchase: req.body.totalAmount },
+      }
+    )
+    /*
+    let notificationResult = null
+
+    if (req.body.partPayment) {
+      notificationResult = await sendNotification('credit', {
+        user,
+        transaction,
+      })
+    } else {
+      notificationResult = await sendNotification('product_purchase', {
+        user,
+        transaction,
+      })
+    }
+
+    if (req.body.from) {
+      io.emit(`purchase`, {
+        transaction,
+        notification: notificationResult.notification,
+        unread: notificationResult.unread,
+      })
+    }
+    */
+
+    io.emit('transaction', { transaction })
+
+    const result = await queryData<IProduct>(Product, req)
+    res.status(200).json({
+      message: 'The transaction has been created successfully.',
+      result,
+      transaction,
+      notificationResult: null,
+    })
+  } catch (error: any) {
+    handleError(res, undefined, undefined, error)
+  }
+}
+
+export const massDeleteTrasanction = async (req: Request, res: Response) => {
+  try {
+    const transactions = await Transaction.find({ _id: { $in: req.body.ids } })
+    for (let x = 0; x < transactions.length; x++) {
+      const tx = transactions[x]
+      for (let i = 0; i < tx.cartProducts.length; i++) {
+        const cart = tx.cartProducts[i]
+        await Product.findByIdAndUpdate(cart._id, {
+          $inc: { units: cart.cartUnits * (cart.unitPerPurchase || 1) },
+        })
+      }
+    }
+    await Transaction.deleteMany({ _id: { $in: req.body.ids } })
+
+    const result = await queryData<ITransaction>(Transaction, req)
+    res.status(200).json({
+      message: 'The transactions has been deleted successfully.',
+      result,
+    })
+  } catch (error: any) {
+    handleError(res, undefined, undefined, error)
+  }
+}
+
+export const getTransactions = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    const result = await queryData<ITransaction>(Transaction, req)
+    res.status(200).json(result)
+  } catch (error: any) {
+    handleError(res, undefined, undefined, error)
+  }
+}
+
+export const updateTransaction = async (req: Request, res: Response) => {
+  try {
+    const oldTransaction = await Transaction.findById(req.params.id)
+    if (!oldTransaction) {
+      return res.status(404).json({ message: 'Transaction not found' })
+    }
+
+    // Sync inventory if cartUnits changed
+    if (req.body.cartProducts) {
+      const newCart = Array.isArray(req.body.cartProducts) ? req.body.cartProducts : JSON.parse(req.body.cartProducts)
+      const oldCart = oldTransaction.cartProducts
+
+      for (const newItem of newCart) {
+        const oldItem = oldCart.find((oi: any) => oi._id.toString() === newItem._id.toString())
+        if (oldItem) {
+          const diff = oldItem.cartUnits - newItem.cartUnits
+          if (diff !== 0) {
+            const amountChange = diff * (newItem.unitPerPurchase || 1)
+            
+            // If we are increasing quantity (diff is negative), check stock
+            if (amountChange < 0) {
+              const product = await Product.findById(newItem._id)
+              if (!product || product.units < Math.abs(amountChange)) {
+                return res.status(400).json({ 
+                  message: `Insufficient stock for ${newItem.name}. Available: ${product?.units || 0}` 
+                })
+              }
+            }
+
+            await Product.findByIdAndUpdate(newItem._id, {
+              $inc: { units: amountChange },
+            })
+          }
+        }
+      }
+      req.body.cartProducts = newCart
+    }
+
+    // Sync inventory if product changed (for purchases)
+    if (req.body.product) {
+      const newProduct = typeof req.body.product === 'string' ? JSON.parse(req.body.product) : req.body.product
+      const oldProduct = oldTransaction.product
+
+      if (oldProduct && newProduct) {
+        const diff = newProduct.cartUnits - oldProduct.cartUnits
+        if (diff !== 0) {
+          const amountChange = diff * (newProduct.unitPerPurchase || 1)
+          
+          // For purchases, if amountChange is negative (reducing purchase qty), we are removing items from inventory.
+          // Let's verify we have enough stock before removing.
+          if (amountChange < 0) {
+            const product = await Product.findById(newProduct._id)
+            if (!product || product.units < Math.abs(amountChange)) {
+              return res.status(400).json({ 
+                message: `Cannot decrease purchase quantity. Insufficient stock remaining in inventory. Available: ${product?.units || 0}` 
+              })
+            }
+          }
+
+          await Product.findByIdAndUpdate(newProduct._id, {
+            $inc: { units: amountChange },
+          })
+        }
+      }
+      req.body.product = newProduct
+    }
+
+    await Transaction.findByIdAndUpdate(req.params.id, req.body)
+
+    const result = await queryData<ITransaction>(Transaction, req)
+
+    res.status(200).json({
+      message: 'The transaction has been updated successfully.',
+      result,
+    })
+  } catch (error: any) {
+    handleError(res, undefined, undefined, error)
+  }
+}
+
+export const GetTransactionSummary = async (req: Request, res: Response) => {
+  try {
+    const { dateFrom, dateTo } = req.query
+
+    if (!dateFrom || !dateTo) {
+      return res.status(400).json({ message: 'Date range is required' })
+    }
+
+    const from = new Date(String(dateFrom))
+    const to = new Date(String(dateTo))
+
+    if (isNaN(from.getTime()) || isNaN(to.getTime())) {
+      return res.status(400).json({ message: 'Invalid date format' })
+    }
+
+    // --- 1️⃣ Determine time grouping based on range ---
+    const diffDays = Math.ceil(
+      (to.getTime() - from.getTime()) / (1000 * 60 * 60 * 24)
+    )
+
+    let groupBy: 'day' | 'week' | 'month' | 'year'
+    if (diffDays <= 7) groupBy = 'day'
+    else if (diffDays <= 30) groupBy = 'week'
+    else if (diffDays <= 365) groupBy = 'month'
+    else groupBy = 'year'
+
+    // --- 2️⃣ Build group format ---
+    let dateGroup: Record<string, any>
+    switch (groupBy) {
+      case 'day':
+        dateGroup = {
+          $dateToString: { format: '%Y-%m-%d', date: '$createdAt' },
+        }
+        break
+      case 'week':
+        dateGroup = {
+          $concat: [
+            { $toString: { $isoWeekYear: '$createdAt' } },
+            '-W',
+            { $toString: { $isoWeek: '$createdAt' } },
+          ],
+        }
+        break
+      case 'month':
+        dateGroup = { $dateToString: { format: '%Y-%m', date: '$createdAt' } }
+        break
+      case 'year':
+        dateGroup = { $dateToString: { format: '%Y', date: '$createdAt' } }
+        break
+    }
+
+    // --- 3️⃣ Aggregate grouped data for the chart ---
+    const summary = await Transaction.aggregate([
+      {
+        $match: {
+          createdAt: { $gte: from, $lte: to },
+        },
+      },
+      {
+        $group: {
+          _id: dateGroup,
+          totalSales: {
+            $sum: {
+              $cond: [{ $eq: ['$isProfit', true] }, '$totalAmount', 0],
+            },
+          },
+          totalPurchases: {
+            $sum: {
+              $cond: [{ $eq: ['$isProfit', false] }, '$totalAmount', 0],
+            },
+          },
+        },
+      },
+      {
+        $addFields: {
+          profit: { $subtract: ['$totalSales', '$totalPurchases'] },
+        },
+      },
+      { $sort: { _id: 1 } },
+      {
+        $project: {
+          _id: 0,
+          date: '$_id',
+          totalSales: 1,
+          totalPurchases: 1,
+          profit: 1,
+        },
+      },
+    ])
+
+    // --- 4️⃣ Aggregate overall totals for the whole range ---
+    const totals = await Transaction.aggregate([
+      {
+        $match: {
+          createdAt: { $gte: from, $lte: to },
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          totalSales: {
+            $sum: {
+              $cond: [{ $eq: ['$isProfit', true] }, '$totalAmount', 0],
+            },
+          },
+          totalPurchases: {
+            $sum: {
+              $cond: [{ $eq: ['$isProfit', false] }, '$totalAmount', 0],
+            },
+          },
+        },
+      },
+      {
+        $addFields: {
+          profit: { $subtract: ['$totalSales', '$totalPurchases'] },
+        },
+      },
+      {
+        $project: {
+          _id: 0,
+          totalSales: 1,
+          totalPurchases: 1,
+          profit: 1,
+        },
+      },
+    ])
+
+    res.status(200).json({
+      groupBy,
+      from,
+      to,
+      bars: summary, // for bar chart
+      totals: totals[0] || { totalSales: 0, totalPurchases: 0, profit: 0 }, // for pie chart
+    })
+  } catch (error) {
+    handleError(res, undefined, undefined, error)
+  }
+}
