@@ -52,32 +52,16 @@ app.use(requestLogger)
 
 app.use(
   cors({
-    origin: [
-      'http://localhost:3000',
-      'http://localhost:3001',
-      'http://localhost:3002',
-      'http://localhost:3003',
-      'https://awiza.netlify.app',
-      'https://awizafarm.com',
-    ],
+    origin: "*",
     methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'],
-    credentials: true,
     allowedHeaders: ['Content-Type', 'Authorization', 'socket-id'],
   })
 )
 
 const io = new Server(server, {
   cors: {
-    origin: [
-      'http://localhost:3000',
-      'http://localhost:3001',
-      'http://localhost:3002',
-      'http://localhost:3003',
-      'https://awiza.netlify.app',
-      'https://awizafarm.com',
-    ],
+    origin: "*",
     methods: ['GET', 'POST'],
-    credentials: true,
   },
   transports: ['websocket', 'polling'],
 })
