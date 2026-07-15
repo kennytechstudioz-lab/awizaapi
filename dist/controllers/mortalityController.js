@@ -71,7 +71,7 @@ const createMortality = (req, res) => __awaiter(void 0, void 0, void 0, function
             const crackProduct = yield productModel_1.Product.findOne({ pId: livestock._id, name: 'Cracks' });
             let finalProductId = "";
             if (crackProduct) {
-                finalProductId = crackProduct._id;
+                finalProductId = crackProduct._id.toString();
                 yield productModel_1.Product.findByIdAndUpdate(crackProduct._id, {
                     $inc: { units: quantity },
                     picture: livestock.picture,
@@ -90,7 +90,7 @@ const createMortality = (req, res) => __awaiter(void 0, void 0, void 0, function
                     picture: livestock.picture,
                     purchaseUnit: livestock.purchaseUnit,
                 });
-                finalProductId = newCrack._id;
+                finalProductId = newCrack._id.toString();
             }
             // Automatically create a Production record for Cracks
             yield operationModel_1.Operation.create({

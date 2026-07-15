@@ -30,8 +30,8 @@ export const createMortality = async (
     if (livestock.type === 'Livestock' && !isEggProduct) {
       const staffPen = req.body.pen
       if (!staffPen || staffPen === "No Pen Assigned") {
-        return res.status(400).json({ 
-          message: 'You are not assigned to any Pen House. Operation aborted.' 
+        return res.status(400).json({
+          message: 'You are not assigned to any Pen House. Operation aborted.'
         })
       }
 
@@ -46,8 +46,8 @@ export const createMortality = async (
       }
 
       const updateResult = await Product.updateOne(
-        { 
-          _id: productId, 
+        {
+          _id: productId,
           units: { $gte: quantity },
           "penDistributions": { $elemMatch: { penName: staffPen, units: { $gte: quantity } } }
         },
@@ -56,8 +56,8 @@ export const createMortality = async (
       )
 
       if (updateResult.modifiedCount === 0) {
-        return res.status(400).json({ 
-          message: `Insufficient stock in ${staffPen} for mortality record. Pen stock: ${penEntry.units}, Mortality: ${quantity}` 
+        return res.status(400).json({
+          message: `Insufficient stock in ${staffPen} for mortality record. Pen stock: ${penEntry.units}, Mortality: ${quantity}`
         })
       }
     } else {
@@ -68,8 +68,8 @@ export const createMortality = async (
       )
 
       if (updateResult.modifiedCount === 0) {
-        return res.status(400).json({ 
-          message: `Insufficient stock. Current stock: ${livestock.units}, Mortality: ${quantity}` 
+        return res.status(400).json({
+          message: `Insufficient stock. Current stock: ${livestock.units}, Mortality: ${quantity}`
         })
       }
     }
@@ -78,9 +78,9 @@ export const createMortality = async (
     if (livestock.name.toLowerCase().includes('egg')) {
       const crackProduct = await Product.findOne({ pId: livestock._id, name: 'Cracks' })
       let finalProductId = ""
-      
+
       if (crackProduct) {
-        finalProductId = crackProduct._id
+        finalProductId = crackProduct._id.toString()
         await Product.findByIdAndUpdate(crackProduct._id, {
           $inc: { units: quantity },
           picture: livestock.picture,
@@ -98,7 +98,7 @@ export const createMortality = async (
           picture: livestock.picture,
           purchaseUnit: livestock.purchaseUnit,
         })
-        finalProductId = newCrack._id
+        finalProductId = newCrack._id.toString()
       }
 
       // Automatically create a Production record for Cracks
@@ -115,9 +115,9 @@ export const createMortality = async (
 
     const mortality = await Mortality.create(req.body)
     const result = await queryData<IMortality>(Mortality, req)
-    
+
     io.emit("mortality", { mortality })
-    
+
     res.status(200).json({
       message: 'Mortality recorded successfully',
       result,
@@ -172,8 +172,8 @@ export const updateMortality = async (req: Request, res: Response) => {
             }
 
             await Product.updateOne(
-              { 
-                _id: productId, 
+              {
+                _id: productId,
                 ...(diff < 0 ? { units: { $gte: Math.abs(diff) }, "penDistributions": { $elemMatch: { penName: staffPen, units: { $gte: Math.abs(diff) } } } } : {})
               },
               { $inc: { units: diff, "penDistributions.$[elem].units": diff } },

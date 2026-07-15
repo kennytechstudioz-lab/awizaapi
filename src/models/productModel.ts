@@ -65,7 +65,6 @@ const ProductSchema: Schema = new Schema(
 export const Product = mongoose.model<IProduct>('Product', ProductSchema)
 
 export interface IStocking extends Document {
-  _id: string
   name: string
   units: number
   picture: string
