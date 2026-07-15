@@ -1,7 +1,6 @@
 import mongoose, { Schema, Document } from 'mongoose'
 
 export interface IProduct extends Document {
-  _id: string
   name: string
   purchaseUnit: string
   units: number

@@ -1,7 +1,6 @@
 import mongoose, { Schema, Document } from 'mongoose'
 
 export interface IOperation extends Document {
-    _id: string
     livestockNumber: number
     livestockAge: string
     operation: string
