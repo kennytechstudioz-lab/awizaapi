@@ -1,4 +1,5 @@
 import { Request, Response } from 'express'
+import mongoose from 'mongoose'
 import { queryData } from '../utils/query'
 import { handleError } from '../utils/errorHandler'
 import { ITransaction, Transaction } from '../models/transactionModel'
@@ -12,8 +13,10 @@ import { Company } from '../models/company/companyModel'
 export const purchaseProducts = async (req: Request, res: Response) => {
   try {
     const product = req.body.product
+    const parsedCartUnits = Number(product.cartUnits) || 0;
+    const parsedUnitPerPurchase = Number(product.unitPerPurchase) || 1;
     await Product.findByIdAndUpdate(product._id, {
-      $inc: { units: product.cartUnits * (product.unitPerPurchase || 1) },
+      $inc: { units: parsedCartUnits * parsedUnitPerPurchase },
     })
     await Transaction.create(req.body)
 
@@ -89,6 +92,22 @@ export const createTrasanction = async (req: Request, res: Response) => {
     req.body.isProfit = safeParse(req.body.isProfit, true)
     req.body.partPayment = safeParse(req.body.partPayment, 0)
 
+    const parsedAdjustedTotal = Number(req.body.adjustedTotal)
+    if (!isNaN(parsedAdjustedTotal) && parsedAdjustedTotal > 0 && req.body.isProfit) {
+      req.body.totalAmount = parsedAdjustedTotal
+      req.body.adjustedTotal = parsedAdjustedTotal
+    } else if (req.body.totalAmount !== undefined) {
+      req.body.totalAmount = Number(req.body.totalAmount) || 0
+    }
+
+    if (Array.isArray(cartProducts)) {
+      cartProducts.forEach((p: any) => {
+        if (p.adjustedPrice && Number(p.adjustedPrice) > 0) {
+          p.price = Number(p.adjustedPrice)
+        }
+      })
+    }
+
     if (!Array.isArray(cartProducts) || cartProducts.length === 0) {
       return res.status(400).json({ message: 'Cart is empty' })
     }
@@ -105,58 +124,112 @@ export const createTrasanction = async (req: Request, res: Response) => {
       })
     }
 
-    const outOfStock: { name: string; available: number; requested: number }[] =
-      []
+    const isPendingBooking =
+      req.body.isBooking === 'true' ||
+      req.body.isBooking === true ||
+      req.body.from === 'User' ||
+      req.body.status === false ||
+      req.body.status === 'false'
 
-    for (const cartItem of cartProducts) {
-      const product = dbProducts.find(
-        (p) => p._id.toString() === cartItem._id.toString()
-      )
-      if (!product) continue
-      if (product.units < cartItem.cartUnits * (cartItem.unitPerPurchase || 1)) {
-        outOfStock.push({
-          name: product.name,
-          available: product.units,
-          requested: cartItem.cartUnits,
-        })
+    if (isPendingBooking) {
+      for (const cartItem of cartProducts) {
+        const product = dbProducts.find(
+          (p) => p._id.toString() === cartItem._id.toString()
+        )
+        if (!product) continue
+        const parsedCartUnits = Number(cartItem.cartUnits) || 0
+        const parsedUnitPerPurchase = Number(cartItem.unitPerPurchase) || 1
+        const inStockUnits = Math.floor((Number(product.units) || 0) / parsedUnitPerPurchase)
+        const unitName = product.purchaseUnit || 'units'
+        const rate = Number(product.rate) || 0
+
+        if (parsedCartUnits <= 0) {
+          return res.status(400).json({
+            message: `Invalid booking quantity for ${product.name}. Must book at least 1 ${unitName}.`,
+          })
+        }
+
+        // Second check: check if requested quantity can be fulfilled
+        if (parsedCartUnits > inStockUnits) {
+          if (rate <= 0) {
+            return res.status(400).json({
+              message: `Requested ${parsedCartUnits} ${unitName} exceeds current available stock (${inStockUnits} ${unitName}) and daily production/replenishment rate is not configured for ${product.name}.`,
+            })
+          }
+          const dayOfWeek = new Date().getDay()
+          const remainingDays = dayOfWeek === 0 ? 6 : Math.max(0, 6 - dayOfWeek)
+          const weeklyCapacity = inStockUnits + (remainingDays * rate)
+          if (parsedCartUnits > weeklyCapacity) {
+            return res.status(400).json({
+              message: `Requested ${parsedCartUnits} ${unitName} exceeds maximum weekly availability (${weeklyCapacity} ${unitName}) for ${product.name} through Saturday.`,
+            })
+          }
+        }
       }
-    }
 
-    if (outOfStock.length > 0) {
-      return res.status(400).json({
-        message:
-          'Some items are out of stock. Please adjust your order and try again.',
-        outOfStock,
-      })
-    }
+      req.body.status = false
+    } else {
+      // In-person direct sales: verify immediate stock & deduct immediately
+      const outOfStock: { name: string; available: number; requested: number }[] = []
 
-    // --- NEW VALIDATION: Customer check before any mutation ---
-    if (req.body.userId === '' || !req.body.userId) {
-      const existingUser = await User.findOne({ phone: req.body.phone })
-      if (existingUser) {
+      for (const cartItem of cartProducts) {
+        const product = dbProducts.find(
+          (p) => p._id.toString() === cartItem._id.toString()
+        )
+        if (!product) continue
+        const parsedCartUnits = Number(cartItem.cartUnits) || 0;
+        const parsedUnitPerPurchase = Number(cartItem.unitPerPurchase) || 1;
+        if (product.units < parsedCartUnits * parsedUnitPerPurchase) {
+          outOfStock.push({
+            name: product.name,
+            available: product.units,
+            requested: parsedCartUnits,
+          })
+        }
+      }
+
+      if (outOfStock.length > 0) {
         return res.status(400).json({
-          message: `A customer with this phone number (${req.body.phone}) already exists. Please search and select the customer instead of entering details again.`,
+          message:
+            'Some items are out of stock. Please adjust your order and try again.',
+          outOfStock,
         })
       }
-    }
 
-    const bulkOps = cartProducts.map((cartItem) => ({
-      updateOne: {
-        filter: { 
-          _id: cartItem._id,
-          units: { $gte: cartItem.cartUnits * (cartItem.unitPerPurchase || 1) }
-        },
-        update: {
-          $inc: { units: -cartItem.cartUnits * (cartItem.unitPerPurchase || 1) },
-        },
-      },
-    }))
+      // --- NEW VALIDATION: Customer check before any mutation ---
+      if (req.body.userId === '' || !req.body.userId) {
+        const existingUser = await User.findOne({ phone: req.body.phone })
+        if (existingUser) {
+          return res.status(400).json({
+            message: `A customer with this phone number (${req.body.phone}) already exists. Please search and select the customer instead of entering details again.`,
+          })
+        }
+      }
 
-    const bulkResult = await Product.bulkWrite(bulkOps)
-    if (bulkResult.modifiedCount !== cartProducts.length) {
-      return res.status(400).json({
-        message: 'Some items could not be processed due to insufficient stock. Please refresh and try again.',
+      const bulkOps = cartProducts.map((cartItem) => {
+        const parsedCartUnits = Number(cartItem.cartUnits) || 0;
+        const parsedUnitPerPurchase = Number(cartItem.unitPerPurchase) || 1;
+        const amountToDeduct = parsedCartUnits * parsedUnitPerPurchase;
+
+        return {
+          updateOne: {
+            filter: { 
+              _id: new mongoose.Types.ObjectId(cartItem._id),
+              units: { $gte: amountToDeduct }
+            },
+            update: {
+              $inc: { units: -amountToDeduct },
+            },
+          },
+        };
       })
+
+      const bulkResult = await Product.bulkWrite(bulkOps)
+      if (bulkResult.modifiedCount !== cartProducts.length) {
+        return res.status(400).json({
+          message: 'Some items could not be processed due to insufficient stock. Please refresh and try again.',
+        })
+      }
     }
     const company = await Company.findOne()
     const prefix = 'AWZ'
@@ -218,6 +291,9 @@ export const createTrasanction = async (req: Request, res: Response) => {
     }
     */
 
+    if (!isPendingBooking) {
+      io.emit('stock_update', { products: await Product.find() })
+    }
     io.emit('transaction', { transaction })
 
     const result = await queryData<IProduct>(Product, req)
@@ -237,20 +313,66 @@ export const massDeleteTrasanction = async (req: Request, res: Response) => {
     const transactions = await Transaction.find({ _id: { $in: req.body.ids } })
     for (let x = 0; x < transactions.length; x++) {
       const tx = transactions[x]
-      for (let i = 0; i < tx.cartProducts.length; i++) {
-        const cart = tx.cartProducts[i]
-        await Product.findByIdAndUpdate(cart._id, {
-          $inc: { units: cart.cartUnits * (cart.unitPerPurchase || 1) },
-        })
+      // Only restore stock for approved (status:true) transactions. Pending bookings have no stock deducted yet.
+      if (tx.status) {
+        for (let i = 0; i < tx.cartProducts.length; i++) {
+          const cart = tx.cartProducts[i]
+          const parsedCartUnits = Number(cart.cartUnits) || 0;
+          const parsedUnitPerPurchase = Number(cart.unitPerPurchase) || 1;
+          await Product.findByIdAndUpdate(cart._id, {
+            $inc: { units: parsedCartUnits * parsedUnitPerPurchase },
+          })
+        }
       }
     }
-    await Transaction.deleteMany({ _id: { $in: req.body.ids } })
+    const deletedIds: string[] = req.body.ids
+    await Transaction.deleteMany({ _id: { $in: deletedIds } })
+
+    // Emit deletion event so all clients remove them instantly
+    io.emit('transaction_deleted', { ids: deletedIds })
 
     const result = await queryData<ITransaction>(Transaction, req)
     res.status(200).json({
       message: 'The transactions has been deleted successfully.',
       result,
     })
+  } catch (error: any) {
+    handleError(res, undefined, undefined, error)
+  }
+}
+
+export const deleteSingleTransaction = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params
+    const tx = await Transaction.findById(id)
+    if (!tx) {
+      return res.status(404).json({ message: 'Transaction not found' })
+    }
+
+    // Users can only delete their own pending (not approved) transactions
+    const isUser = req.query.fromUser === 'true'
+    if (isUser && tx.status) {
+      return res.status(403).json({ message: 'Cannot delete an approved transaction' })
+    }
+
+    // Restore stock only if the transaction was approved (status:true)
+    if (tx.status) {
+      for (let i = 0; i < tx.cartProducts.length; i++) {
+        const cart = tx.cartProducts[i]
+        const parsedCartUnits = Number(cart.cartUnits) || 0;
+        const parsedUnitPerPurchase = Number(cart.unitPerPurchase) || 1;
+        await Product.findByIdAndUpdate(cart._id, {
+          $inc: { units: parsedCartUnits * parsedUnitPerPurchase },
+        })
+      }
+    }
+
+    await Transaction.findByIdAndDelete(id)
+
+    // Emit to all clients so they remove it instantly without refresh
+    io.emit('transaction_deleted', { ids: [id] })
+
+    res.status(200).json({ message: 'Transaction deleted successfully.' })
   } catch (error: any) {
     handleError(res, undefined, undefined, error)
   }
@@ -276,16 +398,26 @@ export const updateTransaction = async (req: Request, res: Response) => {
     }
 
     // Sync inventory if cartUnits changed
-    if (req.body.cartProducts) {
+    // IMPORTANT: Only sync stock for already-APPROVED transactions.
+    // Pending bookings have no stock deducted yet, so changing their cart quantities
+    // must NOT touch inventory. Also skip this when status is changing (handled below).
+    const isStatusChangingEarly =
+      req.body.status !== undefined &&
+      Boolean(req.body.status) !== Boolean(oldTransaction.status)
+
+    if (req.body.cartProducts && oldTransaction.status && !isStatusChangingEarly) {
       const newCart = Array.isArray(req.body.cartProducts) ? req.body.cartProducts : JSON.parse(req.body.cartProducts)
       const oldCart = oldTransaction.cartProducts
 
       for (const newItem of newCart) {
         const oldItem = oldCart.find((oi: any) => oi._id.toString() === newItem._id.toString())
         if (oldItem) {
-          const diff = oldItem.cartUnits - newItem.cartUnits
+          const parsedOldCartUnits = Number(oldItem.cartUnits) || 0;
+          const parsedNewCartUnits = Number(newItem.cartUnits) || 0;
+          const parsedUnitPerPurchase = Number(newItem.unitPerPurchase) || 1;
+          const diff = parsedOldCartUnits - parsedNewCartUnits
           if (diff !== 0) {
-            const amountChange = diff * (newItem.unitPerPurchase || 1)
+            const amountChange = diff * parsedUnitPerPurchase
             
             // If we are increasing quantity (diff is negative), check stock
             if (amountChange < 0) {
@@ -304,6 +436,9 @@ export const updateTransaction = async (req: Request, res: Response) => {
         }
       }
       req.body.cartProducts = newCart
+    } else if (req.body.cartProducts) {
+      // Still parse for saving, but don't touch stock
+      req.body.cartProducts = Array.isArray(req.body.cartProducts) ? req.body.cartProducts : JSON.parse(req.body.cartProducts)
     }
 
     // Sync inventory if product changed (for purchases)
@@ -312,9 +447,12 @@ export const updateTransaction = async (req: Request, res: Response) => {
       const oldProduct = oldTransaction.product
 
       if (oldProduct && newProduct) {
-        const diff = newProduct.cartUnits - oldProduct.cartUnits
+        const parsedOldCartUnits = Number(oldProduct.cartUnits) || 0;
+        const parsedNewCartUnits = Number(newProduct.cartUnits) || 0;
+        const parsedUnitPerPurchase = Number(newProduct.unitPerPurchase) || 1;
+        const diff = parsedNewCartUnits - parsedOldCartUnits
         if (diff !== 0) {
-          const amountChange = diff * (newProduct.unitPerPurchase || 1)
+          const amountChange = diff * parsedUnitPerPurchase
           
           // For purchases, if amountChange is negative (reducing purchase qty), we are removing items from inventory.
           // Let's verify we have enough stock before removing.
@@ -335,13 +473,92 @@ export const updateTransaction = async (req: Request, res: Response) => {
       req.body.product = newProduct
     }
 
+    // Handle Transaction Approval (Pending -> Approved/Paid) or reversal
+    if (isStatusChangingEarly) {
+      const isApproving = Boolean(req.body.status) === true
+
+      if (isApproving) {
+        // Record approving staff name (Requirement 4)
+        if (req.body.staffName) {
+          req.body.staffName = req.body.staffName
+        }
+
+        const cartItems = oldTransaction.cartProducts || []
+        const productIds = cartItems.map((p: any) => p._id)
+        const currentProducts = await Product.find({ _id: { $in: productIds } })
+
+        // Check stock availability in DB before approving
+        for (const item of cartItems) {
+          const dbProd = currentProducts.find(
+            (p) => p._id.toString() === item._id.toString()
+          )
+          const parsedCartUnits = Number(item.cartUnits) || 0
+          const parsedUnitPerPurchase = Number(item.unitPerPurchase) || 1
+          const neededUnits = parsedCartUnits * parsedUnitPerPurchase
+
+          if (!dbProd || dbProd.units < neededUnits) {
+            return res.status(400).json({
+              message: `Cannot approve order. Insufficient stock for ${item.name || 'product'}. Available: ${
+                dbProd ? Math.floor(dbProd.units / parsedUnitPerPurchase) : 0
+              } crates (${dbProd?.units || 0} units), Required: ${parsedCartUnits} crates (${neededUnits} units).`,
+            })
+          }
+        }
+
+        // Deduct the stock upon approval (Requirement 4)
+        const bulkOps = cartItems.map((cartItem: any) => {
+          const parsedCartUnits = Number(cartItem.cartUnits) || 0
+          const parsedUnitPerPurchase = Number(cartItem.unitPerPurchase) || 1
+          const amountToDeduct = parsedCartUnits * parsedUnitPerPurchase
+
+          return {
+            updateOne: {
+              filter: {
+                _id: new mongoose.Types.ObjectId(cartItem._id),
+                units: { $gte: amountToDeduct },
+              },
+              update: {
+                $inc: { units: -amountToDeduct },
+              },
+            },
+          }
+        })
+
+        if (bulkOps.length > 0) {
+          const bulkResult = await Product.bulkWrite(bulkOps)
+          if (bulkResult.modifiedCount !== cartItems.length) {
+            return res.status(400).json({
+              message:
+                'Some items could not be deducted due to concurrent inventory changes. Please refresh and try again.',
+            })
+          }
+        }
+      } else {
+        // Reversing from approved to pending: restore the units back to stock
+        const cartItems = oldTransaction.cartProducts || []
+        for (const item of cartItems) {
+          const parsedCartUnits = Number(item.cartUnits) || 0
+          const parsedUnitPerPurchase = Number(item.unitPerPurchase) || 1
+          const amountToRestore = parsedCartUnits * parsedUnitPerPurchase
+          await Product.findByIdAndUpdate(item._id, {
+            $inc: { units: amountToRestore },
+          })
+        }
+      }
+    }
+
     await Transaction.findByIdAndUpdate(req.params.id, req.body)
+
+    const updatedTransaction = await Transaction.findById(req.params.id)
+    io.emit('stock_update', { products: await Product.find() })
+    io.emit('transaction_updated', { transaction: updatedTransaction })
 
     const result = await queryData<ITransaction>(Transaction, req)
 
     res.status(200).json({
       message: 'The transaction has been updated successfully.',
       result,
+      transaction: updatedTransaction,
     })
   } catch (error: any) {
     handleError(res, undefined, undefined, error)

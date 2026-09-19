@@ -41,6 +41,7 @@ export interface ICompany extends Document {
   newVersion: string
   newVersionLink: string
   authCode: string
+  rate: number
   createdAt: Date
 }
 const CompanySchema: Schema = new Schema(
@@ -59,6 +60,7 @@ const CompanySchema: Schema = new Schema(
     allowSignUp: { type: Boolean, default: true },
     allowApplicant: { type: Boolean, default: false },
     authCode: { type: String, default: '000000' },
+    rate: { type: Number, default: 0 },
     createdAt: { type: Date, default: Date.now },
   },
   {

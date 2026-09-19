@@ -55,6 +55,7 @@ const ProductSchema = new mongoose_1.Schema({
     type: { type: String, enum: ['Feed', 'Medicine', 'Water', 'Livestock', 'General'], default: 'General' },
     isProducing: { type: Boolean, default: false },
     isSelling: { type: Boolean, default: false },
+    rate: { type: Number, default: 0 },
     dateOfBirth: { type: Date },
     penDistributions: [
         {

@@ -8,6 +8,7 @@ import {
   purchaseProducts,
   updatePartPayment,
   updateTransaction,
+  deleteSingleTransaction,
 } from '../controllers/transactionController'
 const upload = multer()
 
@@ -18,6 +19,6 @@ router.route('/').get(getTransactions).post(upload.any(), createTrasanction)
 router.route('/purchase').post(purchaseProducts)
 router.route('/barchart').get(GetTransactionSummary)
 router.route('/part-payment/:id').patch(upload.any(), updatePartPayment)
-router.route('/:id').patch(upload.any(), updateTransaction)
+router.route('/:id').patch(upload.any(), updateTransaction).delete(deleteSingleTransaction)
 
 export default router

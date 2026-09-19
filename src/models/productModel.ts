@@ -15,6 +15,7 @@ export interface IProduct extends Document {
   type: 'Feed' | 'Medicine' | 'Water' | 'Livestock' | 'General'
   isProducing: boolean
   isSelling: boolean
+  rate?: number
   createdAt: Date
   dateOfBirth?: Date
   seoTitle: string
@@ -46,6 +47,7 @@ const ProductSchema: Schema = new Schema(
     type: { type: String, enum: ['Feed', 'Medicine', 'Water', 'Livestock', 'General'], default: 'General' },
     isProducing: { type: Boolean, default: false },
     isSelling: { type: Boolean, default: false },
+    rate: { type: Number, default: 0 },
     dateOfBirth: { type: Date },
     penDistributions: [
       {

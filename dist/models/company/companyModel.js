@@ -63,6 +63,7 @@ const CompanySchema = new mongoose_1.Schema({
     allowSignUp: { type: Boolean, default: true },
     allowApplicant: { type: Boolean, default: false },
     authCode: { type: String, default: '000000' },
+    rate: { type: Number, default: 0 },
     createdAt: { type: Date, default: Date.now },
 }, {
     timestamps: true,
