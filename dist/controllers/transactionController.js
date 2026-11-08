@@ -12,7 +12,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.GetTransactionSummary = exports.updateTransaction = exports.getTransactions = exports.massDeleteTrasanction = exports.createTrasanction = exports.updatePartPayment = exports.purchaseProducts = void 0;
+exports.GetTransactionSummary = exports.updateTransaction = exports.getTransactions = exports.deleteSingleTransaction = exports.massDeleteTrasanction = exports.createTrasanction = exports.updatePartPayment = exports.purchaseProducts = void 0;
 const mongoose_1 = __importDefault(require("mongoose"));
 const query_1 = require("../utils/query");
 const errorHandler_1 = require("../utils/errorHandler");
@@ -288,16 +288,22 @@ const massDeleteTrasanction = (req, res) => __awaiter(void 0, void 0, void 0, fu
         const transactions = yield transactionModel_1.Transaction.find({ _id: { $in: req.body.ids } });
         for (let x = 0; x < transactions.length; x++) {
             const tx = transactions[x];
-            for (let i = 0; i < tx.cartProducts.length; i++) {
-                const cart = tx.cartProducts[i];
-                const parsedCartUnits = Number(cart.cartUnits) || 0;
-                const parsedUnitPerPurchase = Number(cart.unitPerPurchase) || 1;
-                yield productModel_1.Product.findByIdAndUpdate(cart._id, {
-                    $inc: { units: parsedCartUnits * parsedUnitPerPurchase },
-                });
+            // Only restore stock for approved (status:true) transactions. Pending bookings have no stock deducted yet.
+            if (tx.status) {
+                for (let i = 0; i < tx.cartProducts.length; i++) {
+                    const cart = tx.cartProducts[i];
+                    const parsedCartUnits = Number(cart.cartUnits) || 0;
+                    const parsedUnitPerPurchase = Number(cart.unitPerPurchase) || 1;
+                    yield productModel_1.Product.findByIdAndUpdate(cart._id, {
+                        $inc: { units: parsedCartUnits * parsedUnitPerPurchase },
+                    });
+                }
             }
         }
-        yield transactionModel_1.Transaction.deleteMany({ _id: { $in: req.body.ids } });
+        const deletedIds = req.body.ids;
+        yield transactionModel_1.Transaction.deleteMany({ _id: { $in: deletedIds } });
+        // Emit deletion event so all clients remove them instantly
+        app_1.io.emit('transaction_deleted', { ids: deletedIds });
         const result = yield (0, query_1.queryData)(transactionModel_1.Transaction, req);
         res.status(200).json({
             message: 'The transactions has been deleted successfully.',
@@ -309,6 +315,39 @@ const massDeleteTrasanction = (req, res) => __awaiter(void 0, void 0, void 0, fu
     }
 });
 exports.massDeleteTrasanction = massDeleteTrasanction;
+const deleteSingleTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const { id } = req.params;
+        const tx = yield transactionModel_1.Transaction.findById(id);
+        if (!tx) {
+            return res.status(404).json({ message: 'Transaction not found' });
+        }
+        // Users can only delete their own pending (not approved) transactions
+        const isUser = req.query.fromUser === 'true';
+        if (isUser && tx.status) {
+            return res.status(403).json({ message: 'Cannot delete an approved transaction' });
+        }
+        // Restore stock only if the transaction was approved (status:true)
+        if (tx.status) {
+            for (let i = 0; i < tx.cartProducts.length; i++) {
+                const cart = tx.cartProducts[i];
+                const parsedCartUnits = Number(cart.cartUnits) || 0;
+                const parsedUnitPerPurchase = Number(cart.unitPerPurchase) || 1;
+                yield productModel_1.Product.findByIdAndUpdate(cart._id, {
+                    $inc: { units: parsedCartUnits * parsedUnitPerPurchase },
+                });
+            }
+        }
+        yield transactionModel_1.Transaction.findByIdAndDelete(id);
+        // Emit to all clients so they remove it instantly without refresh
+        app_1.io.emit('transaction_deleted', { ids: [id] });
+        res.status(200).json({ message: 'Transaction deleted successfully.' });
+    }
+    catch (error) {
+        (0, errorHandler_1.handleError)(res, undefined, undefined, error);
+    }
+});
+exports.deleteSingleTransaction = deleteSingleTransaction;
 const getTransactions = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const result = yield (0, query_1.queryData)(transactionModel_1.Transaction, req);
@@ -326,7 +365,12 @@ const updateTransaction = (req, res) => __awaiter(void 0, void 0, void 0, functi
             return res.status(404).json({ message: 'Transaction not found' });
         }
         // Sync inventory if cartUnits changed
-        if (req.body.cartProducts) {
+        // IMPORTANT: Only sync stock for already-APPROVED transactions.
+        // Pending bookings have no stock deducted yet, so changing their cart quantities
+        // must NOT touch inventory. Also skip this when status is changing (handled below).
+        const isStatusChangingEarly = req.body.status !== undefined &&
+            Boolean(req.body.status) !== Boolean(oldTransaction.status);
+        if (req.body.cartProducts && oldTransaction.status && !isStatusChangingEarly) {
             const newCart = Array.isArray(req.body.cartProducts) ? req.body.cartProducts : JSON.parse(req.body.cartProducts);
             const oldCart = oldTransaction.cartProducts;
             for (const newItem of newCart) {
@@ -354,6 +398,10 @@ const updateTransaction = (req, res) => __awaiter(void 0, void 0, void 0, functi
                 }
             }
             req.body.cartProducts = newCart;
+        }
+        else if (req.body.cartProducts) {
+            // Still parse for saving, but don't touch stock
+            req.body.cartProducts = Array.isArray(req.body.cartProducts) ? req.body.cartProducts : JSON.parse(req.body.cartProducts);
         }
         // Sync inventory if product changed (for purchases)
         if (req.body.product) {
@@ -384,9 +432,7 @@ const updateTransaction = (req, res) => __awaiter(void 0, void 0, void 0, functi
             req.body.product = newProduct;
         }
         // Handle Transaction Approval (Pending -> Approved/Paid) or reversal
-        const isStatusChanging = req.body.status !== undefined &&
-            Boolean(req.body.status) !== Boolean(oldTransaction.status);
-        if (isStatusChanging) {
+        if (isStatusChangingEarly) {
             const isApproving = Boolean(req.body.status) === true;
             if (isApproving) {
                 // Record approving staff name (Requirement 4)
@@ -450,7 +496,7 @@ const updateTransaction = (req, res) => __awaiter(void 0, void 0, void 0, functi
         yield transactionModel_1.Transaction.findByIdAndUpdate(req.params.id, req.body);
         const updatedTransaction = yield transactionModel_1.Transaction.findById(req.params.id);
         app_1.io.emit('stock_update', { products: yield productModel_1.Product.find() });
-        app_1.io.emit('transaction', { transaction: updatedTransaction });
+        app_1.io.emit('transaction_updated', { transaction: updatedTransaction });
         const result = yield (0, query_1.queryData)(transactionModel_1.Transaction, req);
         res.status(200).json({
             message: 'The transaction has been updated successfully.',

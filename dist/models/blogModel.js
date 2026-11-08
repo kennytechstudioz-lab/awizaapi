@@ -41,6 +41,7 @@ const BlogSchema = new mongoose_1.Schema({
     subtitle: { type: String },
     picture: { type: String },
     category: { type: String },
+    author: { type: String, default: 'Awiza Farm' },
     createdAt: { type: Date, default: Date.now },
 }, {
     timestamps: true,

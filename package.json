@@ -6,7 +6,8 @@
     "start": "node --max-old-space-size=1024 dist/server.js",
     "build": "tsc",
     "copy-templates": "copy src\\utils\\emailTemplate.html dist\\utils\\",
-    "dev": "ts-node-dev --respawn --transpile-only src/server.ts"
+    "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "seed:blogs": "ts-node src/scripts/seedBlogs.ts"
   },
   "keywords": [],
   "author": "",
